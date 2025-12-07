@@ -1,246 +1,293 @@
 #!/usr/bin/env python3
 """
-Anime to Desmos - Proper Line Detection
-Converts anime images to clean line paths for Desmos
+Image to Desmos - LINE EQUATIONS (y = mx + b)
+Converts anime outlines to actual linear equations
 """
 
 import cv2
 import numpy as np
 from PIL import Image
 import sys
-import json
 
-def preprocess_image(image_path, target_width=300):
-    """Load and preprocess the image"""
+def detect_black_lines(img, threshold=120):
+    """Detect black lines in anime images - CHARACTER OUTLINES ONLY"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Use Canny edge detection to find ACTUAL OUTLINE EDGES
+    # This finds boundaries between different colors, not just dark pixels
+    blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
+    edges = cv2.Canny(blurred, 50, 150)
+    
+    # Also detect very dark pixels (the actual black lines in anime)
+    _, dark_pixels = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+    
+    # Combine: edges + dark pixels = character outlines
+    combined = cv2.bitwise_or(edges, dark_pixels)
+    
+    # Clean up noise
+    kernel = np.ones((2, 2), np.uint8)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    
+    return combined
+
+def find_line_segments(edges):
+    """
+    Use probabilistic Hough Line Transform to find actual LINE SEGMENTS
+    Returns list of line segments as (x1, y1, x2, y2)
+    """
+    # Probabilistic Hough Line Transform
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,              # Distance resolution in pixels
+        theta=np.pi/180,    # Angle resolution in radians
+        threshold=20,       # Minimum number of votes
+        minLineLength=10,   # Minimum line length
+        maxLineGap=5        # Maximum gap between segments to treat as single line
+    )
+    
+    if lines is None:
+        return []
+    
+    return [line[0] for line in lines]
+
+def line_to_equation(x1, y1, x2, y2, height):
+    """
+    Convert line segment to Desmos equation
+    Returns equation string in form suitable for Desmos
+    """
+    # Flip Y coordinates for Desmos (origin at bottom-left)
+    y1 = height - y1
+    y2 = height - y2
+    
+    # Handle vertical lines
+    if abs(x2 - x1) < 1:
+        # Vertical line: x = constant with y domain
+        y_min = min(y1, y2)
+        y_max = max(y1, y2)
+        return f"x={x1}{{{y_min}<=y<={y_max}}}"
+    
+    # Calculate slope and intercept
+    m = (y2 - y1) / (x2 - x1)
+    b = y1 - m * x1
+    
+    # Determine domain (x bounds)
+    x_min = min(x1, x2)
+    x_max = max(x1, x2)
+    
+    # Round for cleaner output
+    m = round(m, 3)
+    b = round(b, 2)
+    
+    # Build equation string
+    if abs(m) < 0.01:  # Nearly horizontal line
+        y_val = round((y1 + y2) / 2, 2)
+        return f"y={y_val}{{{x_min}<=x<={x_max}}}"
+    else:
+        # Format: y = mx + b {domain}
+        if b >= 0:
+            eq = f"y={m}x+{b}"
+        else:
+            eq = f"y={m}x{b}"  # b already has negative sign
+        
+        return f"{eq}{{{x_min}<=x<={x_max}}}"
+
+def merge_similar_lines(line_segments, angle_threshold=5, distance_threshold=10):
+    """
+    Merge line segments that are very similar (same slope, nearby)
+    Returns merged line segments
+    """
+    if len(line_segments) == 0:
+        return []
+    
+    def get_angle(x1, y1, x2, y2):
+        return np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
+    
+    def get_midpoint(x1, y1, x2, y2):
+        return ((x1 + x2) / 2, (y1 + y2) / 2)
+    
+    merged = []
+    used = set()
+    
+    for i, (x1, y1, x2, y2) in enumerate(line_segments):
+        if i in used:
+            continue
+        
+        angle1 = get_angle(x1, y1, x2, y2)
+        mid1 = get_midpoint(x1, y1, x2, y2)
+        
+        # Find similar lines
+        group = [(x1, y1, x2, y2)]
+        used.add(i)
+        
+        for j, (x3, y3, x4, y4) in enumerate(line_segments):
+            if j in used:
+                continue
+            
+            angle2 = get_angle(x3, y3, x4, y4)
+            mid2 = get_midpoint(x3, y3, x4, y4)
+            
+            # Check if angles are similar
+            angle_diff = abs(angle1 - angle2)
+            if angle_diff > 180:
+                angle_diff = 360 - angle_diff
+            
+            # Check if close together
+            dist = np.sqrt((mid1[0] - mid2[0])**2 + (mid1[1] - mid2[1])**2)
+            
+            if angle_diff < angle_threshold and dist < distance_threshold:
+                group.append((x3, y3, x4, y4))
+                used.add(j)
+        
+        # Merge group into single line
+        if len(group) == 1:
+            merged.append(group[0])
+        else:
+            # Find endpoints of merged line
+            all_points = []
+            for seg in group:
+                all_points.extend([(seg[0], seg[1]), (seg[2], seg[3])])
+            all_points = np.array(all_points)
+            
+            # Fit line to all points
+            if len(all_points) > 1:
+                vx, vy, cx, cy = cv2.fitLine(all_points, cv2.DIST_L2, 0, 0.01, 0.01)
+                
+                # Find extreme points along the line direction
+                t_values = [(p[0] - cx) * vx + (p[1] - cy) * vy for p in all_points]
+                t_min = min(t_values)
+                t_max = max(t_values)
+                
+                x1_new = int(cx + t_min * vx)
+                y1_new = int(cy + t_min * vy)
+                x2_new = int(cx + t_max * vx)
+                y2_new = int(cy + t_max * vy)
+                
+                merged.append((x1_new, y1_new, x2_new, y2_new))
+    
+    return merged
+
+def filter_background_lines(line_segments, width, height, margin=5):
+    """
+    Filter out lines that are on the edges (background)
+    Keep only lines in the center (character)
+    """
+    filtered = []
+    for x1, y1, x2, y2 in line_segments:
+        # Check if line touches the edges
+        on_left_edge = (x1 <= margin or x2 <= margin)
+        on_right_edge = (x1 >= width - margin or x2 >= width - margin)
+        on_top_edge = (y1 <= margin or y2 <= margin)
+        on_bottom_edge = (y1 >= height - margin or y2 >= height - margin)
+        
+        # Skip lines that touch edges (these are usually background/border)
+        if on_left_edge or on_right_edge or on_top_edge or on_bottom_edge:
+            continue
+        
+        filtered.append((x1, y1, x2, y2))
+    
+    return filtered
+
+def process_image(image_path, threshold=120, target_width=300, merge_lines=True):
+    """Main processing function"""
+    
+    print(f"Loading image: {image_path}")
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Could not load image: {image_path}")
     
-    # Resize maintaining aspect ratio
+    # Resize
     height, width = img.shape[:2]
     aspect_ratio = height / width
     new_width = target_width
     new_height = int(target_width * aspect_ratio)
-    
     img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
     
-    return img, new_width, new_height
-
-def detect_edges_advanced(img, low_threshold=50, high_threshold=150):
-    """
-    Advanced edge detection using Canny algorithm
-    Works well for anime/manga with clear outlines
-    """
-    # Convert to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    print(f"Resized to: {new_width}x{new_height}")
+    print(f"Detecting character outlines (threshold: {threshold})...")
     
-    # Apply Gaussian blur to reduce noise
-    blurred = cv2.GaussianBlur(gray, (5, 5), 1.4)
-    
-    # Canny edge detection
-    edges = cv2.Canny(blurred, low_threshold, high_threshold)
-    
-    # Dilate slightly to connect nearby edges
-    kernel = np.ones((2, 2), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
-    
-    return edges
-
-def find_contours(edges):
-    """Find contours (continuous paths) in the edge map"""
-    contours, hierarchy = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Filter out very small contours (noise)
-    min_contour_length = 10
-    filtered_contours = [c for c in contours if len(c) >= min_contour_length]
-    
-    return filtered_contours
-
-def simplify_contour(contour, epsilon_factor=0.002):
-    """
-    Simplify contour using Douglas-Peucker algorithm
-    Reduces number of points while maintaining shape
-    """
-    epsilon = epsilon_factor * cv2.arcLength(contour, True)
-    simplified = cv2.approxPolyDP(contour, epsilon, False)
-    return simplified
-
-def contour_to_desmos_parametric(contour, height, contour_id):
-    """
-    Convert a contour to Desmos parametric equations
-    Returns list of Desmos expressions
-    """
-    # Extract points and flip Y axis for Desmos
-    points = contour.reshape(-1, 2)
-    xs = points[:, 0].tolist()
-    ys = [height - y for y in points[:, 1]]
-    
-    if len(xs) < 2:
-        return []
-    
-    expressions = []
-    
-    # Create the point lists
-    x_var = f"x_{contour_id}"
-    y_var = f"y_{contour_id}"
-    t_var = f"t_{contour_id}"
-    
-    # X coordinates list
-    x_list = f"{x_var}=[{','.join(map(str, xs))}]"
-    expressions.append(x_list)
-    
-    # Y coordinates list
-    y_list = f"{y_var}=[{','.join(map(str, ys))}]"
-    expressions.append(y_list)
-    
-    # Parametric curve
-    n = len(xs)
-    # Use modular indexing to create smooth interpolation
-    parametric = f"({x_var}[\\operatorname{{mod}}(\\operatorname{{round}}({t_var}),{n})+1],{y_var}[\\operatorname{{mod}}(\\operatorname{{round}}({t_var}),{n})+1])"
-    param_with_domain = f"{parametric}\\left\\{{0\\le {t_var}\\le {n-1}\\right\\}}"
-    expressions.append(param_with_domain)
-    
-    return expressions
-
-def contour_to_desmos_simple(contour, height):
-    """
-    Convert contour to simple point list (alternative method)
-    Simpler but works well
-    """
-    points = contour.reshape(-1, 2)
-    xs = points[:, 0].tolist()
-    ys = [height - y for y in points[:, 1]]
-    
-    if len(xs) < 2:
-        return None
-    
-    return f"([{','.join(map(str, xs))}],[{','.join(map(str, ys))}])"
-
-def process_image(image_path, output_file=None, method='parametric', 
-                 edge_low=50, edge_high=150, simplify=0.002, target_width=300):
-    """
-    Main processing function
-    
-    Args:
-        image_path: Path to input image
-        output_file: Optional output file for expressions
-        method: 'parametric' or 'simple'
-        edge_low: Lower threshold for Canny edge detection
-        edge_high: Upper threshold for Canny edge detection
-        simplify: Simplification factor (lower = more detail)
-        target_width: Target width in pixels
-    """
-    print(f"Loading image: {image_path}")
-    img, width, height = preprocess_image(image_path, target_width)
-    
-    print(f"Detecting edges... (thresholds: {edge_low}, {edge_high})")
-    edges = detect_edges_advanced(img, edge_low, edge_high)
-    
-    # Save edge preview
+    edges = detect_black_lines(img, threshold)
     cv2.imwrite('/mnt/user-data/outputs/edges_preview.png', edges)
-    print("Saved edge preview to: /mnt/user-data/outputs/edges_preview.png")
     
-    print("Finding contours...")
-    contours = find_contours(edges)
-    print(f"Found {len(contours)} contours")
+    print("Finding line segments with Hough Transform...")
+    line_segments = find_line_segments(edges)
+    print(f"Found {len(line_segments)} line segments")
     
-    print("Simplifying contours...")
-    simplified_contours = [simplify_contour(c, simplify) for c in contours]
+    # FILTER OUT BACKGROUND LINES
+    print("Filtering out background lines...")
+    line_segments = filter_background_lines(line_segments, new_width, new_height, margin=10)
+    print(f"After filtering: {len(line_segments)} character lines")
     
-    # Filter out very small contours after simplification
-    simplified_contours = [c for c in simplified_contours if len(c) >= 3]
-    print(f"After simplification: {len(simplified_contours)} contours")
+    if merge_lines:
+        print("Merging similar lines...")
+        line_segments = merge_similar_lines(line_segments)
+        print(f"After merging: {len(line_segments)} lines")
     
-    print(f"Generating Desmos expressions using '{method}' method...")
-    all_expressions = []
+    print("Converting to Desmos equations...")
+    equations = []
+    for x1, y1, x2, y2 in line_segments:
+        eq = line_to_equation(x1, y1, x2, y2, new_height)
+        equations.append(eq)
     
-    if method == 'parametric':
-        for i, contour in enumerate(simplified_contours):
-            exprs = contour_to_desmos_parametric(contour, height, i)
-            all_expressions.extend(exprs)
-    else:  # simple
-        for contour in simplified_contours:
-            expr = contour_to_desmos_simple(contour, height)
-            if expr:
-                all_expressions.append(expr)
+    # Visualize
+    vis = np.ones((new_height, new_width, 3), dtype=np.uint8) * 255
+    for x1, y1, x2, y2 in line_segments:
+        cv2.line(vis, (x1, y1), (x2, y2), (0, 0, 0), 2)
+    cv2.imwrite('/mnt/user-data/outputs/line_equations_vis.png', vis)
+    print("Saved visualization to: /mnt/user-data/outputs/line_equations_vis.png")
     
-    print(f"Generated {len(all_expressions)} Desmos expressions")
-    
-    # Output results
-    output_text = '\n'.join(all_expressions)
-    
-    if output_file:
-        with open(output_file, 'w') as f:
-            f.write(output_text)
-        print(f"Saved expressions to: {output_file}")
-    else:
-        print("\n" + "="*80)
-        print("DESMOS EXPRESSIONS (Copy and paste into Desmos):")
-        print("="*80 + "\n")
-        print(output_text)
-        print("\n" + "="*80)
-    
-    # Create visualization
-    print("Creating visualization...")
-    vis = np.ones((height, width, 3), dtype=np.uint8) * 255
-    cv2.drawContours(vis, simplified_contours, -1, (0, 0, 0), 1)
-    cv2.imwrite('/mnt/user-data/outputs/traced_lines.png', vis)
-    print("Saved line visualization to: /mnt/user-data/outputs/traced_lines.png")
-    
-    return all_expressions
+    return equations, new_height
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python anime_to_desmos.py <image_path> [options]")
+        print("Usage: python image_to_lines.py <image_path> [options]")
         print("\nOptions:")
-        print("  --method <parametric|simple>  Output method (default: simple)")
-        print("  --edge-low <int>              Lower edge threshold (default: 50)")
-        print("  --edge-high <int>             Upper edge threshold (default: 150)")
-        print("  --simplify <float>            Simplification factor (default: 0.002)")
-        print("  --width <int>                 Target width in pixels (default: 300)")
-        print("  --output <file>               Save to file instead of stdout")
-        print("\nExamples:")
-        print("  python anime_to_desmos.py levi.jpg")
-        print("  python anime_to_desmos.py levi.jpg --edge-low 30 --edge-high 120")
-        print("  python anime_to_desmos.py levi.jpg --method parametric --width 400")
+        print("  --threshold <int>     Darkness threshold (default: 120)")
+        print("  --width <int>         Output width (default: 300)")
+        print("  --no-merge            Don't merge similar lines")
+        print("  --output <file>       Save to file")
+        print("\nExample:")
+        print("  python image_to_lines.py levi.jpg --threshold 100 --width 400")
         sys.exit(1)
     
     image_path = sys.argv[1]
-    
-    # Parse arguments
-    args = {
-        'method': 'simple',
-        'edge_low': 50,
-        'edge_high': 150,
-        'simplify': 0.002,
-        'target_width': 300,
-        'output_file': None
-    }
+    threshold = 120
+    width = 300
+    merge = True
+    output_file = '/mnt/user-data/outputs/desmos_lines.txt'
     
     i = 2
     while i < len(sys.argv):
-        if sys.argv[i] == '--method' and i+1 < len(sys.argv):
-            args['method'] = sys.argv[i+1]
-            i += 2
-        elif sys.argv[i] == '--edge-low' and i+1 < len(sys.argv):
-            args['edge_low'] = int(sys.argv[i+1])
-            i += 2
-        elif sys.argv[i] == '--edge-high' and i+1 < len(sys.argv):
-            args['edge_high'] = int(sys.argv[i+1])
-            i += 2
-        elif sys.argv[i] == '--simplify' and i+1 < len(sys.argv):
-            args['simplify'] = float(sys.argv[i+1])
+        if sys.argv[i] == '--threshold' and i+1 < len(sys.argv):
+            threshold = int(sys.argv[i+1])
             i += 2
         elif sys.argv[i] == '--width' and i+1 < len(sys.argv):
-            args['target_width'] = int(sys.argv[i+1])
+            width = int(sys.argv[i+1])
             i += 2
+        elif sys.argv[i] == '--no-merge':
+            merge = False
+            i += 1
         elif sys.argv[i] == '--output' and i+1 < len(sys.argv):
-            args['output_file'] = sys.argv[i+1]
+            output_file = sys.argv[i+1]
             i += 2
         else:
             i += 1
     
-    process_image(image_path, **args)
+    equations, height = process_image(image_path, threshold, width, merge)
+    
+    print(f"\n{'='*80}")
+    print(f"Generated {len(equations)} line equations!")
+    print(f"{'='*80}\n")
+    
+    output_text = '\n'.join(equations)
+    
+    with open(output_file, 'w') as f:
+        f.write(output_text)
+    print(f"Saved to: {output_file}\n")
+    
+    print("DESMOS EQUATIONS (Copy these):")
+    print("="*80)
+    print(output_text)
+    print("="*80)
 
 if __name__ == "__main__":
     main()
